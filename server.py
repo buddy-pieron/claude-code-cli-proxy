@@ -27,7 +27,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from claude_cli import ClaudeCLIProvider
+from claude_cli import CLIError, CLITimeoutError, CLIUnavailableError, ClaudeCLIProvider
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,7 +51,7 @@ provider = ClaudeCLIProvider()
 
 app = FastAPI(
     title="Claude Code Proxy",
-    version="1.0.0",
+    version="1.1.0",
     description="OpenAI-compatible API powered by Claude Code CLI",
 )
 app.add_middleware(
@@ -69,6 +69,19 @@ def _check_auth(request: Request):
     token = auth.replace("Bearer ", "").strip()
     if token != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
+
+
+def _error_json(status: int, message: str, error_type: str = "server_error") -> JSONResponse:
+    return JSONResponse(
+        status_code=status,
+        content={
+            "error": {
+                "message": message,
+                "type": error_type,
+                "code": status,
+            }
+        },
+    )
 
 
 @app.get("/health")
@@ -99,9 +112,16 @@ async def chat_completions(request: Request):
             provider.stream_completion(body),
             media_type="text/event-stream",
         )
-    else:
+
+    try:
         result = await provider.complete(body)
         return JSONResponse(result)
+    except CLITimeoutError as e:
+        return _error_json(504, str(e), "timeout_error")
+    except CLIUnavailableError as e:
+        return _error_json(503, str(e), "service_unavailable")
+    except CLIError as e:
+        return _error_json(e.status_code, str(e))
 
 
 @app.post("/v1/messages")
@@ -119,10 +139,17 @@ async def anthropic_messages(request: Request):
             translate_stream(),
             media_type="text/event-stream",
         )
-    else:
+
+    try:
         result = await provider.complete(openai_body)
         anthropic_resp = _openai_to_anthropic(result, body.get("model", ""))
         return JSONResponse(anthropic_resp)
+    except CLITimeoutError as e:
+        return _error_json(504, str(e), "timeout_error")
+    except CLIUnavailableError as e:
+        return _error_json(503, str(e), "service_unavailable")
+    except CLIError as e:
+        return _error_json(e.status_code, str(e))
 
 
 def _anthropic_to_openai(body: dict[str, Any]) -> dict[str, Any]:
@@ -145,11 +172,28 @@ def _anthropic_to_openai(body: dict[str, Any]) -> dict[str, Any]:
         if isinstance(content, str):
             messages.append({"role": role, "content": content})
         elif isinstance(content, list):
-            text = " ".join(
-                blk.get("text", "") for blk in content
-                if isinstance(blk, dict) and blk.get("type") == "text"
-            )
-            messages.append({"role": role, "content": text})
+            openai_blocks: list[dict] = []
+            for blk in content:
+                if not isinstance(blk, dict):
+                    continue
+                if blk.get("type") == "text":
+                    openai_blocks.append({"type": "text", "text": blk.get("text", "")})
+                elif blk.get("type") == "image":
+                    source = blk.get("source", {})
+                    if source.get("type") == "base64":
+                        media_type = source.get("media_type", "image/png")
+                        data = source.get("data", "")
+                        openai_blocks.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{media_type};base64,{data}"},
+                        })
+                    elif source.get("type") == "url":
+                        openai_blocks.append({
+                            "type": "image_url",
+                            "image_url": {"url": source.get("url", "")},
+                        })
+            if openai_blocks:
+                messages.append({"role": role, "content": openai_blocks})
 
     return {
         "model": body.get("model", ""),

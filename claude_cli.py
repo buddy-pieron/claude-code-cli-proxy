@@ -13,10 +13,12 @@ Claude Code subscription, not per-token API spend.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
 import shutil
+import tempfile
 import time
 import uuid
 from typing import Any, AsyncGenerator
@@ -24,55 +26,144 @@ from typing import Any, AsyncGenerator
 logger = logging.getLogger("claude-code-proxy")
 
 DEFAULT_BIN = shutil.which("claude") or "claude"
-
 ALLOWED_DIRS = ["/tmp", os.path.expanduser("~")]
+
+FIRST_CHUNK_TIMEOUT = float(os.getenv("CLAUDE_PROXY_FIRST_CHUNK_TIMEOUT", "180"))
+IDLE_TIMEOUT = float(os.getenv("CLAUDE_PROXY_IDLE_TIMEOUT", "120"))
+MAX_CONCURRENT = int(os.getenv("CLAUDE_PROXY_MAX_CONCURRENT", "2"))
+STREAM_BUFFER_LIMIT = 16 * 1024 * 1024
+
+
+class CLIError(Exception):
+    """Claude CLI returned an error."""
+    def __init__(self, message: str, status_code: int = 502):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class CLITimeoutError(CLIError):
+    """Claude CLI timed out."""
+    def __init__(self, message: str):
+        super().__init__(message, status_code=504)
+
+
+class CLIUnavailableError(CLIError):
+    """Claude CLI binary not found."""
+    def __init__(self, message: str = "Claude CLI binary not found"):
+        super().__init__(message, status_code=503)
+
+
+def _save_base64_image(data: str, media_type: str = "image/png") -> str | None:
+    try:
+        ext = media_type.split("/")[-1].replace("jpeg", "jpg")
+        img_bytes = base64.b64decode(data)
+        fname = f"claude_proxy_img_{uuid.uuid4().hex[:8]}.{ext}"
+        fpath = os.path.join(tempfile.gettempdir(), fname)
+        with open(fpath, "wb") as f:
+            f.write(img_bytes)
+        return fpath
+    except Exception as e:
+        logger.warning(f"Failed to decode image: {e}")
+        return None
+
+
+def _flatten_content(content: Any) -> tuple[str, list[str]]:
+    """Extract text and save any inline images to temp files.
+    Returns (text, list_of_temp_image_paths).
+    """
+    temp_files: list[str] = []
+
+    if isinstance(content, str):
+        return content, temp_files
+
+    if isinstance(content, list):
+        text_parts: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type", "")
+
+            if item_type == "text":
+                text_parts.append(item.get("text", ""))
+
+            elif item_type == "image_url":
+                url_data = item.get("image_url", {})
+                url = url_data.get("url", "") if isinstance(url_data, dict) else str(url_data)
+                if url.startswith("data:image/"):
+                    header, _, b64data = url.partition(",")
+                    media_type = header.split(";")[0].replace("data:", "")
+                    path = _save_base64_image(b64data, media_type)
+                    if path:
+                        temp_files.append(path)
+                        text_parts.append(f"[Attached image saved at: {path}]")
+                    else:
+                        text_parts.append("[Image: decode failed]")
+                elif url.startswith("http"):
+                    text_parts.append(f"[Image URL: {url}]")
+
+            elif item_type == "image":
+                source = item.get("source", {})
+                if source.get("type") == "base64":
+                    path = _save_base64_image(
+                        source.get("data", ""),
+                        source.get("media_type", "image/png"),
+                    )
+                    if path:
+                        temp_files.append(path)
+                        text_parts.append(f"[Attached image saved at: {path}]")
+                elif source.get("type") == "url":
+                    text_parts.append(f"[Image URL: {source.get('url', '')}]")
+
+        return " ".join(text_parts), temp_files
+
+    return str(content or ""), temp_files
 
 
 def _flatten_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        out = []
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                out.append(item.get("text", ""))
-        return "".join(out)
-    return str(content or "")
+    text, _ = _flatten_content(content)
+    return text
 
 
-def _split_messages(messages: list[dict[str, Any]]) -> tuple[str, str, str]:
+def _cleanup_temp_files(paths: list[str]):
+    for p in paths:
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+
+
+def _split_messages(messages: list[dict[str, Any]]) -> tuple[str, str, str, list[str]]:
+    """Split messages into (system, transcript, latest_user, temp_image_paths)."""
     system_parts: list[str] = []
     transcript_lines: list[str] = []
     latest_user = ""
+    all_temp_files: list[str] = []
 
     for msg in messages:
         if not isinstance(msg, dict):
             continue
         role = msg.get("role")
-        content = _flatten_text(msg.get("content"))
+        text, temp_files = _flatten_content(msg.get("content"))
+        all_temp_files.extend(temp_files)
 
         if role == "system":
-            if content:
-                system_parts.append(content)
-            continue
-        if role == "assistant":
-            if content:
-                transcript_lines.append(f"ASSISTANT: {content}")
-            continue
-        if role == "user":
+            if text:
+                system_parts.append(text)
+        elif role == "assistant":
+            if text:
+                transcript_lines.append(f"ASSISTANT: {text}")
+        elif role == "user":
             if latest_user:
                 transcript_lines.append(f"USER: {latest_user}")
-            latest_user = content
-            continue
-        if role == "tool":
+            latest_user = text
+        elif role == "tool":
             transcript_lines.append(
-                f"TOOL_RESULT[{msg.get('tool_call_id', '')}]: {content}"
+                f"TOOL_RESULT[{msg.get('tool_call_id', '')}]: {text}"
             )
-            continue
 
     system = "\n\n".join(s for s in system_parts if s)
     transcript = "\n".join(transcript_lines)
-    return system, transcript, latest_user
+    return system, transcript, latest_user, all_temp_files
 
 
 def _build_prompt(transcript: str, latest_user: str) -> str:
@@ -96,12 +187,19 @@ class ClaudeCLIProvider:
         bin_path: str | None = None,
         default_model: str = "claude-sonnet-4-6",
         allowed_dirs: list[str] | None = None,
+        max_concurrent: int | None = None,
     ):
         self._bin = bin_path or os.getenv("CLAUDE_BIN") or DEFAULT_BIN
         self._default_model = default_model
         self._allowed_dirs = allowed_dirs or ALLOWED_DIRS
+        self._semaphore = asyncio.Semaphore(max_concurrent or MAX_CONCURRENT)
+        self._req_counter = 0
         if not shutil.which(self._bin) and not os.path.exists(self._bin):
             logger.warning(f"claude binary not found at '{self._bin}'")
+
+    def _next_req_id(self) -> str:
+        self._req_counter += 1
+        return f"req-{self._req_counter}"
 
     def _resolve_model(self, params: dict) -> str:
         m = (params.get("model") or "").strip()
@@ -131,6 +229,7 @@ class ClaudeCLIProvider:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            limit=STREAM_BUFFER_LIMIT,
             cwd="/tmp",
         )
         if proc.stdin:
@@ -151,273 +250,91 @@ class ClaudeCLIProvider:
 
     async def complete(self, params: dict) -> dict:
         model = self._resolve_model(params)
-        system, transcript, latest_user = _split_messages(
+        system, transcript, latest_user, temp_files = _split_messages(
             params.get("messages") or []
         )
         prompt = _build_prompt(transcript, latest_user)
+        req_id = self._next_req_id()
+        t0 = time.monotonic()
 
-        proc = await self._spawn(model, system, prompt)
-        text = ""
-        in_tokens = 0
-        out_tokens = 0
-        stop_reason = "stop"
-        is_error = False
-        err_detail = ""
-        FIRST_CHUNK_TIMEOUT = 90.0
-        IDLE_TIMEOUT = 60.0
+        logger.info(f"[{req_id}] complete model={model} prompt_len={len(prompt)}")
 
         try:
-            assert proc.stdout
-            saw_any = False
-            while True:
-                try:
-                    raw = await asyncio.wait_for(
-                        proc.stdout.readline(),
-                        timeout=(
-                            IDLE_TIMEOUT if saw_any else FIRST_CHUNK_TIMEOUT
-                        ),
-                    )
-                except asyncio.TimeoutError:
-                    is_error = True
-                    err_detail = (
-                        "stream idle timeout"
-                        if saw_any
-                        else "no-output timeout"
-                    )
-                    break
-                if not raw:
-                    break
-                saw_any = True
-                evt = self._parse_event_line(raw)
-                if not evt:
-                    continue
-                etype = evt.get("type")
-                if etype == "result":
-                    is_error = bool(evt.get("is_error"))
-                    if is_error:
-                        err_detail = str(evt.get("result") or "")[:500]
-                    text = evt.get("result") or text
-                    usage = evt.get("usage") or {}
-                    in_tokens = int(usage.get("input_tokens") or 0)
-                    out_tokens = int(usage.get("output_tokens") or 0)
-                    sr = evt.get("stop_reason")
-                    if sr:
-                        stop_reason = "stop" if sr == "end_turn" else sr
-        finally:
             try:
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                proc.kill()
+                return await self._run_complete(params, model, system, prompt, req_id, t0)
+            except CLITimeoutError:
+                logger.warning(f"[{req_id}] timeout, retrying once")
+                await asyncio.sleep(2)
+                return await self._run_complete(params, model, system, prompt, req_id, t0)
+        finally:
+            _cleanup_temp_files(temp_files)
 
-        if is_error:
-            raise RuntimeError(f"claude-cli error: {err_detail or 'unknown'}")
+    async def _run_complete(
+        self, params: dict, model: str, system: str, prompt: str,
+        req_id: str, t0: float,
+    ) -> dict:
+        async with self._semaphore:
+            proc = await self._spawn(model, system, prompt)
+            text = ""
+            in_tokens = 0
+            out_tokens = 0
+            stop_reason = "stop"
+            is_error = False
+            err_detail = ""
 
-        return {
-            "id": f"chatcmpl-cli-{uuid.uuid4().hex[:16]}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": params.get("model") or model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": text},
-                    "finish_reason": stop_reason,
-                }
-            ],
-            "usage": {
-                "prompt_tokens": in_tokens,
-                "completion_tokens": out_tokens,
-                "total_tokens": in_tokens + out_tokens,
-            },
-        }
-
-    async def stream_completion(
-        self, params: dict
-    ) -> AsyncGenerator[str, None]:
-        model = self._resolve_model(params)
-        system, transcript, latest_user = _split_messages(
-            params.get("messages") or []
-        )
-        prompt = _build_prompt(transcript, latest_user)
-
-        cid = f"chatcmpl-cli-{uuid.uuid4().hex[:16]}"
-        model_label = params.get("model") or model
-
-        yield _sse(
-            {
-                "id": cid,
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": model_label,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"role": "assistant", "content": ""},
-                        "finish_reason": None,
-                    }
-                ],
-            }
-        )
-
-        proc = await self._spawn(model, system, prompt)
-        finish_reason: str | None = None
-        in_tokens = 0
-        out_tokens = 0
-        emitted_any_text = False
-        FIRST_CHUNK_TIMEOUT = 90.0
-        IDLE_TIMEOUT = 60.0
-
-        try:
-            assert proc.stdout
-            saw_any = False
-            while True:
-                try:
-                    raw = await asyncio.wait_for(
-                        proc.stdout.readline(),
-                        timeout=(
-                            IDLE_TIMEOUT if saw_any else FIRST_CHUNK_TIMEOUT
-                        ),
-                    )
-                except asyncio.TimeoutError:
-                    timeout_kind = "idle" if saw_any else "no-output"
-                    yield _sse(
-                        {
-                            "id": cid,
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": model_label,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {
-                                        "content": f"[claude-cli error] stream {timeout_kind} timeout"
-                                    },
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-                    )
-                    finish_reason = "stop"
-                    break
-                if not raw:
-                    break
-                saw_any = True
-                evt = self._parse_event_line(raw)
-                if not evt:
-                    continue
-                etype = evt.get("type")
-                if etype == "stream_event":
-                    inner = evt.get("event") or {}
-                    inner_type = inner.get("type")
-                    if inner_type == "content_block_delta":
-                        delta = inner.get("delta") or {}
-                        if delta.get("type") == "text_delta":
-                            t = delta.get("text") or ""
-                            if t:
-                                emitted_any_text = True
-                                yield _sse(
-                                    {
-                                        "id": cid,
-                                        "object": "chat.completion.chunk",
-                                        "created": int(time.time()),
-                                        "model": model_label,
-                                        "choices": [
-                                            {
-                                                "index": 0,
-                                                "delta": {"content": t},
-                                                "finish_reason": None,
-                                            }
-                                        ],
-                                    }
-                                )
-                    elif inner_type == "message_delta":
-                        usage = inner.get("usage") or {}
-                        if usage.get("input_tokens") is not None:
-                            in_tokens = int(
-                                usage.get("input_tokens") or in_tokens
-                            )
-                        if usage.get("output_tokens") is not None:
-                            out_tokens = int(
-                                usage.get("output_tokens") or out_tokens
-                            )
-                        sr = (inner.get("delta") or {}).get("stop_reason")
-                        if sr:
-                            finish_reason = (
-                                "stop" if sr == "end_turn" else sr
-                            )
-                elif etype == "result":
-                    if bool(evt.get("is_error")):
-                        err = str(
-                            evt.get("result") or "claude-cli error"
-                        )[:500]
-                        yield _sse(
-                            {
-                                "id": cid,
-                                "object": "chat.completion.chunk",
-                                "created": int(time.time()),
-                                "model": model_label,
-                                "choices": [
-                                    {
-                                        "index": 0,
-                                        "delta": {
-                                            "content": f"[claude-cli error] {err}"
-                                        },
-                                        "finish_reason": None,
-                                    }
-                                ],
-                            }
+            try:
+                assert proc.stdout
+                saw_any = False
+                while True:
+                    try:
+                        raw = await asyncio.wait_for(
+                            proc.stdout.readline(),
+                            timeout=IDLE_TIMEOUT if saw_any else FIRST_CHUNK_TIMEOUT,
                         )
-                        finish_reason = "stop"
-                    else:
+                    except asyncio.TimeoutError:
+                        kind = "idle" if saw_any else "no-output"
+                        raise CLITimeoutError(f"stream {kind} timeout")
+                    if not raw:
+                        break
+                    saw_any = True
+                    evt = self._parse_event_line(raw)
+                    if not evt:
+                        continue
+                    if evt.get("type") == "result":
+                        is_error = bool(evt.get("is_error"))
+                        if is_error:
+                            err_detail = str(evt.get("result") or "")[:500]
+                        text = evt.get("result") or text
                         usage = evt.get("usage") or {}
-                        if usage.get("input_tokens") is not None:
-                            in_tokens = int(
-                                usage.get("input_tokens") or in_tokens
-                            )
-                        if usage.get("output_tokens") is not None:
-                            out_tokens = int(
-                                usage.get("output_tokens") or out_tokens
-                            )
-                        if not emitted_any_text:
-                            full = evt.get("result") or ""
-                            if full:
-                                yield _sse(
-                                    {
-                                        "id": cid,
-                                        "object": "chat.completion.chunk",
-                                        "created": int(time.time()),
-                                        "model": model_label,
-                                        "choices": [
-                                            {
-                                                "index": 0,
-                                                "delta": {"content": full},
-                                                "finish_reason": None,
-                                            }
-                                        ],
-                                    }
-                                )
+                        in_tokens = int(usage.get("input_tokens") or 0)
+                        out_tokens = int(usage.get("output_tokens") or 0)
                         sr = evt.get("stop_reason")
-                        if sr and not finish_reason:
-                            finish_reason = (
-                                "stop" if sr == "end_turn" else sr
-                            )
-        finally:
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                proc.kill()
+                        if sr:
+                            stop_reason = "stop" if sr == "end_turn" else sr
+            finally:
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    proc.kill()
 
-        yield _sse(
-            {
-                "id": cid,
-                "object": "chat.completion.chunk",
+            elapsed = time.monotonic() - t0
+            logger.info(
+                f"[{req_id}] done {elapsed:.1f}s in={in_tokens} out={out_tokens} error={is_error}"
+            )
+
+            if is_error:
+                raise CLIError(err_detail or "unknown CLI error")
+
+            return {
+                "id": f"chatcmpl-cli-{uuid.uuid4().hex[:16]}",
+                "object": "chat.completion",
                 "created": int(time.time()),
-                "model": model_label,
+                "model": params.get("model") or model,
                 "choices": [
                     {
                         "index": 0,
-                        "delta": {},
-                        "finish_reason": finish_reason or "stop",
+                        "message": {"role": "assistant", "content": text},
+                        "finish_reason": stop_reason,
                     }
                 ],
                 "usage": {
@@ -426,7 +343,164 @@ class ClaudeCLIProvider:
                     "total_tokens": in_tokens + out_tokens,
                 },
             }
+
+    async def stream_completion(
+        self, params: dict
+    ) -> AsyncGenerator[str, None]:
+        model = self._resolve_model(params)
+        system, transcript, latest_user, temp_files = _split_messages(
+            params.get("messages") or []
         )
+        prompt = _build_prompt(transcript, latest_user)
+        req_id = self._next_req_id()
+        t0 = time.monotonic()
+
+        logger.info(f"[{req_id}] stream model={model} prompt_len={len(prompt)}")
+
+        cid = f"chatcmpl-cli-{uuid.uuid4().hex[:16]}"
+        model_label = params.get("model") or model
+
+        yield _sse({
+            "id": cid,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model_label,
+            "choices": [
+                {"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}
+            ],
+        })
+
+        finish_reason: str | None = None
+        in_tokens = 0
+        out_tokens = 0
+        emitted_any_text = False
+        is_error = False
+
+        await self._semaphore.acquire()
+        try:
+            proc = await self._spawn(model, system, prompt)
+            try:
+                assert proc.stdout
+                saw_any = False
+                while True:
+                    try:
+                        raw = await asyncio.wait_for(
+                            proc.stdout.readline(),
+                            timeout=IDLE_TIMEOUT if saw_any else FIRST_CHUNK_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        kind = "idle" if saw_any else "no-output"
+                        is_error = True
+                        yield _sse({
+                            "id": cid,
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": model_label,
+                            "choices": [
+                                {"index": 0, "delta": {"content": f"[error] stream {kind} timeout"}, "finish_reason": None}
+                            ],
+                        })
+                        finish_reason = "stop"
+                        break
+                    if not raw:
+                        break
+                    saw_any = True
+                    evt = self._parse_event_line(raw)
+                    if not evt:
+                        continue
+                    etype = evt.get("type")
+
+                    if etype == "stream_event":
+                        inner = evt.get("event") or {}
+                        inner_type = inner.get("type")
+                        if inner_type == "content_block_delta":
+                            delta = inner.get("delta") or {}
+                            if delta.get("type") == "text_delta":
+                                t = delta.get("text") or ""
+                                if t:
+                                    emitted_any_text = True
+                                    yield _sse({
+                                        "id": cid,
+                                        "object": "chat.completion.chunk",
+                                        "created": int(time.time()),
+                                        "model": model_label,
+                                        "choices": [
+                                            {"index": 0, "delta": {"content": t}, "finish_reason": None}
+                                        ],
+                                    })
+                        elif inner_type == "message_delta":
+                            usage = inner.get("usage") or {}
+                            if usage.get("input_tokens") is not None:
+                                in_tokens = int(usage.get("input_tokens") or in_tokens)
+                            if usage.get("output_tokens") is not None:
+                                out_tokens = int(usage.get("output_tokens") or out_tokens)
+                            sr = (inner.get("delta") or {}).get("stop_reason")
+                            if sr:
+                                finish_reason = "stop" if sr == "end_turn" else sr
+
+                    elif etype == "result":
+                        if bool(evt.get("is_error")):
+                            is_error = True
+                            err = str(evt.get("result") or "CLI error")[:500]
+                            yield _sse({
+                                "id": cid,
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": model_label,
+                                "choices": [
+                                    {"index": 0, "delta": {"content": f"[error] {err}"}, "finish_reason": None}
+                                ],
+                            })
+                            finish_reason = "stop"
+                        else:
+                            usage = evt.get("usage") or {}
+                            if usage.get("input_tokens") is not None:
+                                in_tokens = int(usage.get("input_tokens") or in_tokens)
+                            if usage.get("output_tokens") is not None:
+                                out_tokens = int(usage.get("output_tokens") or out_tokens)
+                            if not emitted_any_text:
+                                full = evt.get("result") or ""
+                                if full:
+                                    yield _sse({
+                                        "id": cid,
+                                        "object": "chat.completion.chunk",
+                                        "created": int(time.time()),
+                                        "model": model_label,
+                                        "choices": [
+                                            {"index": 0, "delta": {"content": full}, "finish_reason": None}
+                                        ],
+                                    })
+                            sr = evt.get("stop_reason")
+                            if sr and not finish_reason:
+                                finish_reason = "stop" if sr == "end_turn" else sr
+            finally:
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    proc.kill()
+        finally:
+            self._semaphore.release()
+            _cleanup_temp_files(temp_files)
+
+        elapsed = time.monotonic() - t0
+        logger.info(
+            f"[{req_id}] stream done {elapsed:.1f}s in={in_tokens} out={out_tokens} error={is_error}"
+        )
+
+        yield _sse({
+            "id": cid,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model_label,
+            "choices": [
+                {"index": 0, "delta": {}, "finish_reason": finish_reason or "stop"}
+            ],
+            "usage": {
+                "prompt_tokens": in_tokens,
+                "completion_tokens": out_tokens,
+                "total_tokens": in_tokens + out_tokens,
+            },
+        })
         yield "data: [DONE]\n\n"
 
     async def health_check(self) -> bool:
