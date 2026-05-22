@@ -51,7 +51,7 @@ provider = ClaudeCLIProvider()
 
 app = FastAPI(
     title="Claude Code Proxy",
-    version="1.1.0",
+    version="1.2.0",
     description="OpenAI-compatible API powered by Claude Code CLI",
 )
 app.add_middleware(
@@ -87,7 +87,15 @@ def _error_json(status: int, message: str, error_type: str = "server_error") -> 
 @app.get("/health")
 async def health():
     ok = await provider.health_check()
-    return {"status": "ok" if ok else "degraded", "provider": "claude-cli"}
+    cb_state = provider._circuit_breaker.state
+    status = "ok" if ok and cb_state == "closed" else "degraded"
+    if cb_state == "open":
+        status = "unhealthy"
+    return {
+        "status": status,
+        "provider": "claude-cli",
+        "circuit_breaker": provider._circuit_breaker.stats,
+    }
 
 
 @app.get("/v1/models")
