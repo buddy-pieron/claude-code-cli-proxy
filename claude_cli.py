@@ -32,6 +32,71 @@ FIRST_CHUNK_TIMEOUT = float(os.getenv("CLAUDE_PROXY_FIRST_CHUNK_TIMEOUT", "180")
 IDLE_TIMEOUT = float(os.getenv("CLAUDE_PROXY_IDLE_TIMEOUT", "120"))
 MAX_CONCURRENT = int(os.getenv("CLAUDE_PROXY_MAX_CONCURRENT", "2"))
 STREAM_BUFFER_LIMIT = 16 * 1024 * 1024
+HEARTBEAT_INTERVAL = float(os.getenv("CLAUDE_PROXY_HEARTBEAT_INTERVAL", "15"))
+CB_FAILURE_THRESHOLD = int(os.getenv("CLAUDE_PROXY_CB_FAILURE_THRESHOLD", "5"))
+CB_RECOVERY_TIMEOUT = float(os.getenv("CLAUDE_PROXY_CB_RECOVERY_TIMEOUT", "30"))
+
+
+class CircuitBreaker:
+    def __init__(
+        self,
+        failure_threshold: int = CB_FAILURE_THRESHOLD,
+        recovery_timeout: float = CB_RECOVERY_TIMEOUT,
+    ):
+        self._failure_count = 0
+        self._failure_threshold = failure_threshold
+        self._recovery_timeout = recovery_timeout
+        self._last_failure_time = 0.0
+        self._state = "closed"
+        self._total_trips = 0
+
+    def can_execute(self) -> bool:
+        if self._state == "closed":
+            return True
+        if self._state == "open":
+            if time.monotonic() - self._last_failure_time >= self._recovery_timeout:
+                self._state = "half-open"
+                logger.info("circuit breaker half-open, allowing probe request")
+                return True
+            return False
+        return True
+
+    def record_success(self):
+        if self._state == "half-open":
+            logger.info("circuit breaker closed after successful probe")
+        self._failure_count = 0
+        self._state = "closed"
+
+    def record_failure(self):
+        self._failure_count += 1
+        self._last_failure_time = time.monotonic()
+        if self._failure_count >= self._failure_threshold:
+            if self._state != "open":
+                self._total_trips += 1
+                logger.warning(
+                    f"circuit breaker OPEN after {self._failure_count} failures "
+                    f"(trip #{self._total_trips})"
+                )
+            self._state = "open"
+
+    @property
+    def state(self) -> str:
+        if (
+            self._state == "open"
+            and time.monotonic() - self._last_failure_time >= self._recovery_timeout
+        ):
+            return "half-open"
+        return self._state
+
+    @property
+    def stats(self) -> dict:
+        return {
+            "state": self.state,
+            "failure_count": self._failure_count,
+            "failure_threshold": self._failure_threshold,
+            "recovery_timeout_sec": self._recovery_timeout,
+            "total_trips": self._total_trips,
+        }
 
 
 class CLIError(Exception):
@@ -193,6 +258,7 @@ class ClaudeCLIProvider:
         self._default_model = default_model
         self._allowed_dirs = allowed_dirs or ALLOWED_DIRS
         self._semaphore = asyncio.Semaphore(max_concurrent or MAX_CONCURRENT)
+        self._circuit_breaker = CircuitBreaker()
         self._req_counter = 0
         if not shutil.which(self._bin) and not os.path.exists(self._bin):
             logger.warning(f"claude binary not found at '{self._bin}'")
@@ -259,13 +325,26 @@ class ClaudeCLIProvider:
 
         logger.info(f"[{req_id}] complete model={model} prompt_len={len(prompt)}")
 
+        if not self._circuit_breaker.can_execute():
+            _cleanup_temp_files(temp_files)
+            raise CLIUnavailableError(
+                f"circuit breaker open ({self._circuit_breaker.stats['failure_count']} consecutive failures)"
+            )
+
         try:
             try:
-                return await self._run_complete(params, model, system, prompt, req_id, t0)
+                result = await self._run_complete(params, model, system, prompt, req_id, t0)
+                self._circuit_breaker.record_success()
+                return result
             except CLITimeoutError:
                 logger.warning(f"[{req_id}] timeout, retrying once")
                 await asyncio.sleep(2)
-                return await self._run_complete(params, model, system, prompt, req_id, t0)
+                result = await self._run_complete(params, model, system, prompt, req_id, t0)
+                self._circuit_breaker.record_success()
+                return result
+        except (CLIError, CLITimeoutError, CLIUnavailableError):
+            self._circuit_breaker.record_failure()
+            raise
         finally:
             _cleanup_temp_files(temp_files)
 
@@ -360,6 +439,20 @@ class ClaudeCLIProvider:
         cid = f"chatcmpl-cli-{uuid.uuid4().hex[:16]}"
         model_label = params.get("model") or model
 
+        if not self._circuit_breaker.can_execute():
+            _cleanup_temp_files(temp_files)
+            yield _sse({
+                "id": cid,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model_label,
+                "choices": [
+                    {"index": 0, "delta": {"role": "assistant", "content": "[error] circuit breaker open"}, "finish_reason": "stop"}
+                ],
+            })
+            yield "data: [DONE]\n\n"
+            return
+
         yield _sse({
             "id": cid,
             "object": "chat.completion.chunk",
@@ -383,12 +476,27 @@ class ClaudeCLIProvider:
                 assert proc.stdout
                 saw_any = False
                 while True:
-                    try:
-                        raw = await asyncio.wait_for(
-                            proc.stdout.readline(),
-                            timeout=IDLE_TIMEOUT if saw_any else FIRST_CHUNK_TIMEOUT,
-                        )
-                    except asyncio.TimeoutError:
+                    total_wait = IDLE_TIMEOUT if saw_any else FIRST_CHUNK_TIMEOUT
+                    wait_elapsed = 0.0
+                    got_line = False
+                    raw = b""
+                    readline_task = asyncio.ensure_future(proc.stdout.readline())
+                    while wait_elapsed < total_wait:
+                        chunk_wait = min(HEARTBEAT_INTERVAL, total_wait - wait_elapsed)
+                        try:
+                            raw = await asyncio.wait_for(
+                                asyncio.shield(readline_task),
+                                timeout=chunk_wait,
+                            )
+                            got_line = True
+                            break
+                        except asyncio.TimeoutError:
+                            wait_elapsed += chunk_wait
+                            if wait_elapsed < total_wait:
+                                yield ": keepalive\n\n"
+
+                    if not got_line:
+                        readline_task.cancel()
                         kind = "idle" if saw_any else "no-output"
                         is_error = True
                         yield _sse({
@@ -402,6 +510,7 @@ class ClaudeCLIProvider:
                         })
                         finish_reason = "stop"
                         break
+
                     if not raw:
                         break
                     saw_any = True
@@ -481,6 +590,11 @@ class ClaudeCLIProvider:
         finally:
             self._semaphore.release()
             _cleanup_temp_files(temp_files)
+
+        if is_error:
+            self._circuit_breaker.record_failure()
+        else:
+            self._circuit_breaker.record_success()
 
         elapsed = time.monotonic() - t0
         logger.info(
