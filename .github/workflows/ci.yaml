@@ -37,14 +37,14 @@ jobs:
 
     # tests on spesific python version 
     - name: Run tests on python 3.10 ver
-      run: python3.10 pytest tests/ -v 
+      run: python3.10 -m pytest tests/ -v 
 
     - name: Run tests on python 3.11 ver
-      run: python3.11 pytest tests/ -v 
+      run: python3.11 -m pytest tests/ -v 
 
     - name: Run tests on python 3.12 ver
-      run: python3.12 pytest tests/ -v 
+      run: python3.12 -m  pytest tests/ -v 
 
     - name: Run tests on python 3.13 ver
-      run: python3.13 pytest tests/ -v 
+      run: python3.13 -m  pytest tests/ -v 
 
