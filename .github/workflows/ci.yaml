@@ -1,6 +1,5 @@
 name: CI  # ワークフローの名前
 
-# 1. どのタイミングで動かすかを指定する（PushとPR）
 on:
   push:
     branches: [ "main" ]
@@ -8,9 +7,7 @@ on:
     branches: [ "main" ]
 
 jobs:
-  # テストを実行する「ジョブ」を定義
   test-job:
-    # 2. 動かす環境（OS）を指定する
     runs-on: ubuntu-latest
 
     steps:
@@ -43,8 +40,8 @@ jobs:
       run: python3.11 -m pytest tests/ -v 
 
     - name: Run tests on python 3.12 ver
-      run: python3.12 -m  pytest tests/ -v 
+      run: python3.12 -m pytest tests/ -v 
 
     - name: Run tests on python 3.13 ver
-      run: python3.13 -m  pytest tests/ -v 
+      run: python3.13 -m pytest tests/ -v 
 
