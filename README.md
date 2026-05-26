@@ -1,3 +1,4 @@
+[![CI](https://github.com/shiroka1125/claude-code-cli-proxy/actions/workflows/ci.yaml/badge.svg)](https://github.com/shiroka1125/claude-code-cli-proxy/actions/workflows/ci.yaml)
 # Claude Code CLI Proxy
 
 Turn your Claude Code subscription into a local OpenAI-compatible API.
